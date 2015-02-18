@@ -16,6 +16,9 @@
 #include <linux/dm-ioctl.h>
 #include <linux/hdreg.h>
 #include <linux/compat.h>
+#ifdef CONFIG_DEV_NS
+#include <linux/dev_namespace.h>
+#endif
 
 #include <asm/uaccess.h>
 
@@ -32,6 +35,9 @@ struct hash_cell {
 
 	char *name;
 	char *uuid;
+#ifdef CONFIG_DEV_NS
+	struct dev_namespace *dev_ns;
+#endif
 	struct mapped_device *md;
 	struct dm_table *new_map;
 };
@@ -97,6 +103,18 @@ static unsigned int hash_str(const char *str)
 	return h & MASK_BUCKETS;
 }
 
+#ifdef CONFIG_DEV_NS
+static int hc_in_cur_ns(const struct hash_cell *hc)
+{
+	return hc->dev_ns == current_dev_ns();
+}
+
+static int hc_visible_in_cur_ns(const struct hash_cell *hc)
+{
+	return hc_in_cur_ns(hc) || current_dev_ns() == &init_dev_ns;
+}
+#endif
+
 /*-----------------------------------------------------------------
  * Code for looking up a device by name
  *---------------------------------------------------------------*/
@@ -107,6 +125,10 @@ static struct hash_cell *__get_name_cell(const char *str)
 
 	list_for_each_entry (hc, _name_buckets + h, name_list)
 		if (!strcmp(hc->name, str)) {
+#ifdef CONFIG_DEV_NS
+			if (!hc_in_cur_ns(hc))
+				continue;
+#endif
 			dm_get(hc->md);
 			return hc;
 		}
@@ -121,6 +143,10 @@ static struct hash_cell *__get_uuid_cell(const char *str)
 
 	list_for_each_entry (hc, _uuid_buckets + h, uuid_list)
 		if (!strcmp(hc->uuid, str)) {
+#ifdef CONFIG_DEV_NS
+			if (!hc_visible_in_cur_ns(hc))
+				continue;
+#endif
 			dm_get(hc->md);
 			return hc;
 		}
@@ -176,6 +202,10 @@ static struct hash_cell *alloc_cell(const char *name, const char *uuid,
 		}
 	}
 
+#ifdef CONFIG_DEV_NS
+	hc->dev_ns = get_dev_ns(current_dev_ns());
+#endif
+
 	INIT_LIST_HEAD(&hc->name_list);
 	INIT_LIST_HEAD(&hc->uuid_list);
 	hc->md = md;
@@ -186,6 +216,9 @@ static struct hash_cell *alloc_cell(const char *name, const char *uuid,
 static void free_cell(struct hash_cell *hc)
 {
 	if (hc) {
+#ifdef CONFIG_DEV_NS
+		put_dev_ns(hc->dev_ns);
+#endif
 		kfree(hc->name);
 		kfree(hc->uuid);
 		kfree(hc);
@@ -286,6 +319,14 @@ retry:
 				dev_skipped++;
 				continue;
 			}
+
+#ifdef CONFIG_DEV_NS
+			if (!hc_visible_in_cur_ns(hc)) {
+				dm_put(md);
+				dev_skipped++;
+				continue;
+			}
+#endif
 
 			__hash_remove(hc);
 
@@ -492,6 +533,10 @@ static int list_devices(struct dm_ioctl *param, size_t param_size)
 	 */
 	for (i = 0; i < NUM_BUCKETS; i++) {
 		list_for_each_entry (hc, _name_buckets + i, name_list) {
+#ifdef CONFIG_DEV_NS
+			if (!hc_visible_in_cur_ns(hc))
+				continue;
+#endif
 			needed += sizeof(struct dm_name_list);
 			needed += strlen(hc->name) + 1;
 			needed += ALIGN_MASK;
@@ -515,6 +560,10 @@ static int list_devices(struct dm_ioctl *param, size_t param_size)
 	 */
 	for (i = 0; i < NUM_BUCKETS; i++) {
 		list_for_each_entry (hc, _name_buckets + i, name_list) {
+#ifdef CONFIG_DEV_NS
+			if (!hc_visible_in_cur_ns(hc))
+				continue;
+#endif
 			if (old_nl)
 				old_nl->next = (uint32_t) ((void *) nl -
 							   (void *) old_nl);
@@ -1770,8 +1819,24 @@ int dm_copy_name_and_uuid(struct mapped_device *md, char *name, char *uuid)
 		goto out;
 	}
 
-	if (name)
+#ifdef CONFIG_DEV_NS
+	if (!hc_visible_in_cur_ns(hc)) {
+		r = -EPERM;
+		goto out;
+	}
+#endif
+
+	if (name) {
 		strcpy(name, hc->name);
+#ifdef CONFIG_DEV_NS
+		if (!hc_in_cur_ns(hc)) {
+			size_t name_len = strlen(hc->name);
+			snprintf(name + name_len, DM_NAME_LEN - name_len - 1,
+				"[ns:%d]", dev_ns_init_pid(hc->dev_ns));
+			name[DM_NAME_LEN - 1] = '\0';
+		}
+#endif
+	}
 	if (uuid)
 		strcpy(uuid, hc->uuid ? : "");
 

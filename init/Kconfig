@@ -850,7 +850,34 @@ config NET_NS
 	  Allow user space to create what appear to be multiple instances
 	  of the network stack.
 
+config DEV_NS
+	bool "Device Namespaces (EXPERIMENTAL)"
+	default n
+	depends on PID_NS
+	help
+	Support device driver namespaces. This allows drivers to multiplex
+	access to its physical or logical resources. A device namespace has
+	a one-to-one relationship with a PID namespace currentl, but this
+	will likely change in the future.
+
 endif # NAMESPACES
+
+menuconfig CELLROX
+	bool "Cellrox support" if EXPERT
+	default !EXPERT
+	help
+	  Provides features needed to support Cellrox Android multi-persona.
+
+if CELLROX
+
+config CELLROX_VMALLOC_OVERRIDE
+	int "Override reserved in-kernel vmalloc area"
+	default 0
+	depends on DEV_NS
+	help
+	  Override the default or command line size of vmalloc area reserved
+	  in the kernel.
+endif # CELLROX
 
 config SCHED_AUTOGROUP
 	bool "Automatic process group scheduling"

@@ -8,7 +8,22 @@
  * the Free Software Foundation.
  */
 
+#ifdef CONFIG_DEV_NS
+#define DEBUG
+#define DEBUG_MUCH
+#ifdef DEBUG_MUCH
+#define pr_fmt(fmt) \
+	"[%d] devns:evdev [%s:%d]: " fmt, \
+	current->pid, __func__, __LINE__
+#else
+#define pr_fmt(fmt) \
+	"[%d] devns:evdev: " fmt, current->pid
+#endif
+#endif /* CONFIG_DEV_NS */
+
+#ifndef pr_fmt
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+#endif
 
 #define EVDEV_MINOR_BASE	64
 #define EVDEV_MINORS		32
@@ -24,7 +39,17 @@
 #include <linux/major.h>
 #include <linux/device.h>
 #include <linux/wakelock.h>
+#ifdef CONFIG_DEV_NS
+#include <linux/dev_namespace.h>
+#endif
+
 #include "input-compat.h"
+
+#define EVDEV_DEBUG(fmt, a...)						\
+	if (evdev_debug)						\
+		pr_info(fmt, ## a)
+
+static int evdev_debug = 0;
 
 struct evdev {
 	int open;
@@ -41,6 +66,50 @@ struct evdev {
 	int hw_ts_nsec;
 };
 
+#ifdef CONFIG_DEV_NS
+struct evdev_dev_ns;
+
+ /*
+  * Input protocol state is tracked to properly handle namepsace switch in the
+  * middle of an input packets. Normally, input packets end with SYN_REPORT,
+  * but if a switch occurs in the middle, then the switched-out namespace will
+  * miss (a few events and) the matching SYN_REPORT, while the switched-in
+  * namespace will receive partial packet. This is addressed by forcing a
+  * SYN_DROPPED on both namespaces upon a switch, focrcing both to drop
+  * subsequent events until the next SYN_REPORT. Furthermore, the SYN_DROPPED
+  * event will cause the userspace input system to reset its multitouch motion
+  * tracking thus preventing a situation in which input events are directed
+  * to the wrong multitouch slot when switching back to the orignal namespace.
+  *
+  * Track input packet state:
+  *
+  * PACKET_FLAG_ON: client in mid-packet, e.g. after non-SYN event
+  * PACKET_FLAG_REPORTALL: the SYN_REPORT terminating the packet should be
+  *   passed to all device namespaces (not just the active one). This is
+  *   required, for example, if a devns agnostic event was passed in the
+  *   current packet to all clients then so should the terminating SYN_REPORT.
+  *
+  * The state machine works as follows:
+  *
+  * non-SYN event: set PACKET_FLAG_ON and. If the event is devns agnostic then
+  * also set PACKET_FLAG_REPORTALL.
+  * SYN_REPORT: clear all packet flags, since it marks packet end.
+  * namespace switch: force SYN_DROPPED, and also toss a SYN_REPORT if there's
+  *   no ongoing packet (PACKET_FLAG_ON is cleared) (otherwise, a SYN_REPORT
+  *   will be passed soon from the ongoing packet).
+  *
+  * As we're tracking the global evdev packet state and not the local state as
+  * percieved by each client it makes more sense to track the state machine in
+  * the evdev instead of each client. However, for simplicitly and due to
+  * laziness this patch tracks the state per client, instead. Note that these
+  * generalizations break for "grabbed" clients (luckily, Android does not use
+  * that feature). To properly handle grabs, the per-client tracking approach
+  * may prove better afterall.
+  */
+#define PACKET_FLAG_ON			0x0001
+#define PACKET_FLAG_REPORTALL		0x0002
+#endif	/* CONFIG_DEV_NS */
+
 struct evdev_client {
 	unsigned int head;
 	unsigned int tail;
@@ -48,7 +117,14 @@ struct evdev_client {
 	spinlock_t buffer_lock; /* protects access to buffer, head and tail */
 	struct wake_lock wake_lock;
 	bool use_wake_lock;
-	char name[28];
+	char name[44];
+#ifdef CONFIG_DEV_NS
+	struct evdev_dev_ns *evdev_ns;
+	struct list_head list;
+	bool grab;
+	spinlock_t packet_flags_lock;
+	int packet_flags;		/* for tracking input packet state */
+#endif
 	struct fasync_struct *fasync;
 	struct evdev *evdev;
 	struct list_head node;
@@ -60,9 +136,270 @@ struct evdev_client {
 static struct evdev *evdev_table[EVDEV_MINORS];
 static DEFINE_MUTEX(evdev_table_mutex);
 
+static void evdev_force_pass_event(struct evdev_client *client,
+			           struct input_event *event,
+			           ktime_t mono, ktime_t real);
+
+#ifdef CONFIG_DEV_NS
+struct evdev_dev_ns {
+	struct mutex mutex;
+	struct list_head clients;
+	struct dev_ns_info dev_ns_info;
+};
+
+/* evdev_ns_id, get_evdev_ns(), get_evdev_ns_cur(), put_evdev_ns() */
+DEFINE_DEV_NS_INFO(evdev)
+
+/* indicate whether an evdev client is in the foreground */
+static bool evdev_client_is_active(struct evdev_client *client)
+{
+	return is_active_dev_ns(client->evdev_ns->dev_ns_info.dev_ns);
+}
+
+static struct notifier_block evdev_ns_switch_notifier;
+static int evdev_grab(struct evdev *evdev, struct evdev_client *client);
+static int evdev_ungrab(struct evdev *evdev, struct evdev_client *client);
+
+/* evdev_ns helpers */
+static struct dev_ns_info *evdev_devns_create(struct dev_namespace *dev_ns)
+{
+	struct evdev_dev_ns *evdev_ns;
+	struct dev_ns_info *dev_ns_info;
+
+	evdev_ns = kzalloc(sizeof(*evdev_ns), GFP_KERNEL);
+	if (!evdev_ns)
+		return ERR_PTR(-ENOMEM);
+
+	mutex_init(&evdev_ns->mutex);
+	INIT_LIST_HEAD(&evdev_ns->clients);
+
+	pr_info("new evdev_dev_ns %p (d %p)\n", evdev_ns, dev_ns);
+
+	dev_ns_info = &evdev_ns->dev_ns_info;
+
+	dev_ns_info->nb = evdev_ns_switch_notifier;
+	dev_ns_register_notify(dev_ns, &dev_ns_info->nb);
+
+	return dev_ns_info;
+
+}
+
+static void evdev_devns_release(struct dev_ns_info *dev_ns_info)
+{
+	struct evdev_dev_ns *evdev_ns;
+
+	evdev_ns = container_of(dev_ns_info, struct evdev_dev_ns, dev_ns_info);
+
+	pr_info("del evdev_dev_ns %p (d %p)\n", evdev_ns, dev_ns_info->dev_ns);
+	dev_ns_unregister_notify(dev_ns_info->dev_ns, &dev_ns_info->nb);
+
+	kfree(evdev_ns);
+}
+
+static struct dev_ns_ops evdev_ns_ops = {
+	.create = evdev_devns_create,
+	.release = evdev_devns_release,
+};
+
+static int evdev_ns_track_client(struct evdev_client *client)
+{
+	struct evdev_dev_ns *evdev_ns;
+
+	evdev_ns = get_evdev_ns_cur();
+	if (!evdev_ns)
+		return -ENOMEM;
+
+	pr_info("track new client 0x%p in evdev_ns 0x%p (dev_ns 0x%p)\n",
+		client, evdev_ns, evdev_ns->dev_ns_info.dev_ns);
+
+	client->evdev_ns = evdev_ns;
+	client->grab = false;
+
+	mutex_lock(&evdev_ns->mutex);
+	list_add(&client->list, &evdev_ns->clients);
+	mutex_unlock(&evdev_ns->mutex);
+
+	return 0;
+}
+
+static void evdev_ns_untrack_client(struct evdev_client *client)
+{
+	struct evdev_dev_ns *evdev_ns;
+
+	evdev_ns = client->evdev_ns;
+
+	pr_info("untrack client 0x%p in evdev_ns 0x%p (dev_ns 0x%p)\n",
+		client, evdev_ns, evdev_ns->dev_ns_info.dev_ns);
+
+	mutex_lock(&evdev_ns->mutex);
+	list_del(&client->list);
+	mutex_unlock(&evdev_ns->mutex);
+
+	put_evdev_ns(evdev_ns);
+}
+
+static void evdev_reset_client_input(struct evdev_client *client)
+{
+	struct input_event event;
+	ktime_t time_mono, time_real;
+	bool wakeup = false;
+
+	spin_lock(&client->packet_flags_lock);
+
+	time_mono = ktime_get();
+	time_real = ktime_sub(time_mono, ktime_get_monotonic_offset());
+
+	/* Inject a SYN_DROPPED. Clients are ok with two SYN_DROPPED in a packet. */
+	event.type = EV_SYN;
+	event.code = SYN_DROPPED;
+	event.value = 0;
+	evdev_force_pass_event(client, &event, time_mono, time_real);
+
+	/* If packet was currently ongoing then the SYN_DROPPED will drop all
+	 * other events in this packet from now on. Otherwise, pass an
+	 * additional SYN_REPORT to terminate our SYN_DROPPED and avoid
+	 * dropping the next packet.*/
+	if (client->packet_flags & PACKET_FLAG_ON) {
+		/* Set PACKET_FLAG_REPORTALL so the packet's terminating
+		 * SYN_REPORT will be passed to this client regardless of
+		 * whether it's active or not. */
+		client->packet_flags |= PACKET_FLAG_REPORTALL;
+	} else {
+		event.type = EV_SYN;
+		event.code = SYN_REPORT;
+		event.value = 0;
+		evdev_force_pass_event(client, &event, time_mono, time_real);
+		client->packet_flags = 0;
+		wakeup = true;
+	}
+
+	spin_unlock(&client->packet_flags_lock);
+	if (wakeup)
+		wake_up_interruptible(&client->evdev->wait);
+}
+
+/* dev_ns and resepctive fb_dev_ns protected by caller */
+static int evdev_ns_switch_callback(struct notifier_block *self,
+				    unsigned long action, void *data)
+{
+	struct dev_namespace *dev_ns = data;
+	struct evdev_dev_ns *evdev_ns;
+	struct evdev_client *client;
+
+	evdev_ns = find_evdev_ns(dev_ns);
+	WARN(evdev_ns == NULL, "devns 0x%p: no matching evdev_ns\n", dev_ns);
+
+	pr_info("%sactivating evdev_ns %p (dev_ns %p:%s)\n",
+	        action == DEV_NS_EVENT_ACTIVATE ? "" : "de", evdev_ns, dev_ns, dev_ns->tag);
+
+	mutex_lock(&evdev_ns->mutex);
+	switch (action) {
+	case DEV_NS_EVENT_ACTIVATE:
+		list_for_each_entry(client, &evdev_ns->clients, list)
+		{
+			mutex_lock(&client->evdev->mutex);
+			pr_info("client %s (%p) (client->grab=%d, client->evdev->grab=%p) in activated ns\n",
+			        client->name, client, client->grab, client->evdev->grab);
+			if (client->grab)
+				evdev_grab(client->evdev, client);
+			evdev_reset_client_input(client);
+			mutex_unlock(&client->evdev->mutex);
+		}
+		break;
+	case DEV_NS_EVENT_DEACTIVATE:
+		list_for_each_entry(client, &evdev_ns->clients, list)
+		{
+			mutex_lock(&client->evdev->mutex);
+			pr_info("client %s (%p) (client->grab=%d, client->evdev->grab=%p) in deactivated ns\n",
+			        client->name, client, client->grab, client->evdev->grab);
+			if (client->evdev->grab == client)
+				evdev_ungrab(client->evdev, client);
+			evdev_reset_client_input(client);
+			mutex_unlock(&client->evdev->mutex);
+		}
+		break;
+	}
+	mutex_unlock(&evdev_ns->mutex);
+	return 0;
+}
+
+static struct notifier_block evdev_ns_switch_notifier = {
+	.notifier_call = evdev_ns_switch_callback,
+};
+
+static bool is_devns_agnostic(struct input_event *event)
+{
+	/* Currently, only switch events are considered namespace agnostic but
+	 * others might be added in the future. */
+	switch (event->type) {
+	case EV_SW:
+		return true;
+	}
+	return false;
+}
+
+/* This must be called with client->packet_flags_lock taken. */
+static bool should_pass_event(struct evdev_client *client,
+			      struct input_event *event)
+{
+	const bool active = evdev_client_is_active(client);
+	const bool devns_agnostic = is_devns_agnostic(event);
+	const bool report_all = (client->packet_flags & PACKET_FLAG_REPORTALL);
+	const bool syn_report = (event->type == EV_SYN &&
+	                         event->code == SYN_REPORT);
+
+	EVDEV_DEBUG("evdev event %d:%d:%d for client %p:%s, "
+	            "active=%d, devns_agnostic=%d, report_all=%d\n",
+	            event->type, event->code, event->value,
+	            client, client->name, active, devns_agnostic, report_all);
+
+	return devns_agnostic || active || (report_all && syn_report);
+}
+#endif /* CONFIG_DEV_NS */
+
 static void evdev_pass_event(struct evdev_client *client,
 			     struct input_event *event,
 			     ktime_t mono, ktime_t real)
+{
+#ifdef CONFIG_DEV_NS
+	spin_lock(&client->packet_flags_lock);
+
+	if (!should_pass_event(client, event))
+		goto skip_pass;
+#endif
+
+	evdev_force_pass_event(client, event, mono, real);
+
+#ifdef CONFIG_DEV_NS
+skip_pass:
+	/* Track input packet state for client. A SYN_REPORT always terminates
+	 * a packet whether it should be dropped or not. A non-SYN event
+	 * indicates a packet is ongoing unless previously dropped. */
+	if (event->type == EV_SYN) {
+		switch (event->code) {
+		case SYN_REPORT:
+			client->packet_flags = 0;
+			break;
+		default:
+			pr_warning("unexpected SYN event, code=%d, value=%d\n",
+			           event->code, event->value);
+			break;
+		}
+	} else {
+		client->packet_flags |= PACKET_FLAG_ON;
+		if (is_devns_agnostic(event))
+			client->packet_flags |= PACKET_FLAG_REPORTALL;
+	}
+
+	spin_unlock(&client->packet_flags_lock);
+#endif
+}
+
+/* Pass an input event to the client regardless devns constraints
+ * This must be called with client->packet_flags_lock taken. */
+static void evdev_force_pass_event(struct evdev_client *client,
+			           struct input_event *event,
+			           ktime_t mono, ktime_t real)
 {
 	event->time = ktime_to_timeval(client->clkid == CLOCK_MONOTONIC ?
 					mono : real);
@@ -135,11 +472,16 @@ static void evdev_event(struct input_handle *handle,
 
 	client = rcu_dereference(evdev->grab);
 
-	if (client)
+	if (client) {
+		EVDEV_DEBUG("passing evdev event %d:%d to "
+		            "grabbed client %p:%s\n",
+		            type, code, client, client->name);
 		evdev_pass_event(client, &event, time_mono, time_real);
+	}
 	else
-		list_for_each_entry_rcu(client, &evdev->client_list, node)
+		list_for_each_entry_rcu(client, &evdev->client_list, node) {
 			evdev_pass_event(client, &event, time_mono, time_real);
+		}
 
 	rcu_read_unlock();
 
@@ -192,6 +534,9 @@ static int evdev_grab(struct evdev *evdev, struct evdev_client *client)
 {
 	int error;
 
+	pr_info("grabbing on client %p (evdev=%p, evdev->grab=%p)\n",
+	        client, evdev, evdev->grab);
+
 	if (evdev->grab)
 		return -EBUSY;
 
@@ -199,6 +544,10 @@ static int evdev_grab(struct evdev *evdev, struct evdev_client *client)
 	if (error)
 		return error;
 
+#ifdef CONFIG_DEV_NS
+
+	client->grab = true;
+#endif
 	rcu_assign_pointer(evdev->grab, client);
 
 	return 0;
@@ -206,9 +555,15 @@ static int evdev_grab(struct evdev *evdev, struct evdev_client *client)
 
 static int evdev_ungrab(struct evdev *evdev, struct evdev_client *client)
 {
+	pr_info("grabbing on client %p (evdev=%p, evdev->grab=%p)\n",
+	        client, evdev, evdev->grab);
+
 	if (evdev->grab != client)
 		return  -EINVAL;
 
+#ifdef CONFIG_DEV_NS
+	client->grab = false;
+#endif
 	rcu_assign_pointer(evdev->grab, NULL);
 	synchronize_rcu();
 	input_release_device(&evdev->handle);
@@ -289,6 +644,10 @@ static int evdev_release(struct inode *inode, struct file *file)
 		evdev_ungrab(evdev, client);
 	mutex_unlock(&evdev->mutex);
 
+#ifdef CONFIG_DEV_NS
+	evdev_ns_untrack_client(client);
+#endif
+
 	evdev_detach_client(evdev, client);
 	if (client->use_wake_lock)
 		wake_lock_destroy(&client->wake_lock);
@@ -344,22 +703,38 @@ static int evdev_open(struct inode *inode, struct file *file)
 	client->clkid = CLOCK_MONOTONIC;
 	client->bufsize = bufsize;
 	spin_lock_init(&client->buffer_lock);
-	snprintf(client->name, sizeof(client->name), "%s-%d",
+	i = snprintf(client->name, sizeof(client->name), "%s-%d",
 			dev_name(&evdev->dev), task_tgid_vnr(current));
+#ifdef CONFIG_DEV_NS
+	spin_lock_init(&client->packet_flags_lock);
+	snprintf(client->name + i, sizeof(client->name) - i, "[ns:%d]",
+		 dev_ns_init_pid(current_dev_ns()));
+#endif
 	client->evdev = evdev;
+
+#ifdef CONFIG_DEV_NS
+	error = evdev_ns_track_client(client);
+	if (error)
+		goto err_free_client;
+#endif
+
 	evdev_attach_client(evdev, client);
 
 	error = evdev_open_device(evdev);
 	if (error)
-		goto err_free_client;
+		goto err_detach_client;
 
 	file->private_data = client;
 	nonseekable_open(inode, file);
 
 	return 0;
 
- err_free_client:
+ err_detach_client:
 	evdev_detach_client(evdev, client);
+#ifdef CONFIG_DEV_NS
+	evdev_ns_untrack_client(client);
+ err_free_client:
+#endif
 	kfree(client);
  err_put_evdev:
 	put_device(&evdev->dev);
@@ -393,6 +768,13 @@ static ssize_t evdev_write(struct file *file, const char __user *buffer,
 		}
 		retval += input_event_size();
 
+		EVDEV_DEBUG("write to evdev client %p:%s, active=%d\n",
+		            client, client->name, evdev_client_is_active(client));
+
+#ifdef CONFIG_DEV_NS
+		if (!evdev_client_is_active(client))
+			continue;
+#endif
 		input_inject_event(&evdev->handle,
 				   event.type, event.code, event.value);
 	} while (retval + input_event_size() <= count);
@@ -758,12 +1140,27 @@ static long evdev_do_ioctl(struct file *file, unsigned int cmd,
 		if (get_user(v, ip + 1))
 			return -EFAULT;
 
+		pr_info("EVIOCSREP on %sactive client %p:%s\n",
+		        evdev_client_is_active(client) ? "" : "in",
+			client, client->name);
+
+#ifdef CONFIG_DEV_NS
+		if (!evdev_client_is_active(client))
+			return 0;
+#endif
 		input_inject_event(&evdev->handle, EV_REP, REP_DELAY, u);
 		input_inject_event(&evdev->handle, EV_REP, REP_PERIOD, v);
 
 		return 0;
 
 	case EVIOCRMFF:
+		pr_info("EVIOCRMFF on %sactive client %p:%s\n",
+		        evdev_client_is_active(client) ? "" : "in",
+			client, client->name);
+#ifdef CONFIG_DEV_NS
+		if (!evdev_client_is_active(client))
+			return 0;
+#endif
 		return input_ff_erase(dev, (int)(unsigned long) p, file);
 
 	case EVIOCGEFFECTS:
@@ -774,6 +1171,17 @@ static long evdev_do_ioctl(struct file *file, unsigned int cmd,
 		return 0;
 
 	case EVIOCGRAB:
+#ifdef CONFIG_DEV_NS
+		pr_info("%sgrab called on client %p from %sactive ns",
+	                p ? "" : "un", client, evdev_client_is_active(client) ? "" : "in");
+		if (!evdev_client_is_active(client)) {
+					if (p)
+				client->grab = true;
+			else
+				client->grab = false;
+			return 0;
+		} /* else */
+#endif
 		if (p)
 			return evdev_grab(evdev, client);
 		else
@@ -791,6 +1199,10 @@ static long evdev_do_ioctl(struct file *file, unsigned int cmd,
 		return evdev_handle_get_keycode(dev, p);
 
 	case EVIOCSKEYCODE:
+#ifdef CONFIG_DEV_NS
+		if (!evdev_client_is_active(client))
+			return 0;
+#endif
 		return evdev_handle_set_keycode(dev, p);
 
 	case EVIOCGKEYCODE_V2:
@@ -844,6 +1256,10 @@ static long evdev_do_ioctl(struct file *file, unsigned int cmd,
 		return str_to_user(dev->uniq, size, p);
 
 	case EVIOC_MASK_SIZE(EVIOCSFF):
+#ifdef CONFIG_DEV_NS
+		if (!evdev_client_is_active(client))
+			return 0;
+#endif
 		if (input_ff_effect_from_user(p, size, &effect))
 			return -EFAULT;
 
@@ -884,6 +1300,10 @@ static long evdev_do_ioctl(struct file *file, unsigned int cmd,
 
 	if (_IOC_DIR(cmd) == _IOC_WRITE) {
 
+#ifdef CONFIG_DEV_NS
+		if (!evdev_client_is_active(client))
+			return 0;
+#endif
 		if ((_IOC_NR(cmd) & ~ABS_MAX) == _IOC_NR(EVIOCSABS(0))) {
 
 			if (!dev->absinfo)
@@ -1113,13 +1533,79 @@ static struct input_handler evdev_handler = {
 	.id_table	= evdev_ids,
 };
 
+static ssize_t evdev_debug_store(struct kobject *kobj,
+				 struct kobj_attribute *attr,
+				 const char *buf, size_t n)
+{
+	if (n == 0) {
+		return 0;
+	}
+
+	switch (*buf) {
+	case '0':
+		evdev_debug = 0;
+		break;
+	case '1':
+		evdev_debug = 1;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return n;
+}
+
+static struct kobj_attribute evdev_debug_attr = {
+	.attr = {
+		.name = "evdev_debug",
+		.mode = 0220,
+	},
+	.show = NULL,
+	.store = evdev_debug_store,
+};
+
+static struct attribute *g[] = {
+	&evdev_debug_attr.attr,
+	NULL,
+};
+
+static struct attribute_group attr_group = {
+	.attrs = g,
+};
+
+static struct kobject *evdev_debug_kobj;
+
 static int __init evdev_init(void)
 {
-	return input_register_handler(&evdev_handler);
+	int ret;
+
+	ret = input_register_handler(&evdev_handler);
+	if (ret < 0)
+		return ret;
+#ifdef CONFIG_DEV_NS
+	ret = DEV_NS_REGISTER(evdev, "event dev");
+	if (ret < 0) {
+		input_unregister_handler(&evdev_handler);
+		return ret;
+	}
+#endif
+
+	evdev_debug_kobj = kobject_create_and_add("evdev", NULL);
+	if (!evdev_debug_kobj)
+		return -ENOMEM;
+
+	ret = sysfs_create_group(evdev_debug_kobj, &attr_group);
+	if (!ret)
+		return ret;
+
+	return 0;
 }
 
 static void __exit evdev_exit(void)
 {
+#ifdef CONFIG_DEV_NS
+	DEV_NS_UNREGISTER(evdev);
+#endif
 	input_unregister_handler(&evdev_handler);
 }
 

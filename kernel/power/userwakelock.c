@@ -17,6 +17,7 @@
 #include <linux/module.h>
 #include <linux/wakelock.h>
 #include <linux/slab.h>
+#include <linux/dev_namespace.h>
 
 #include "power.h"
 
@@ -35,9 +36,70 @@ static DEFINE_MUTEX(tree_lock);
 struct user_wake_lock {
 	struct rb_node		node;
 	struct wake_lock	wake_lock;
+#ifdef CONFIG_DEV_NS
+	struct dev_namespace	*dev_ns;
+#endif
 	char			name[0];
 };
 struct rb_root user_wake_locks;
+
+
+#ifdef CONFIG_DEV_NS
+/* Desroy all the wakelocks that belong to a device namespace */
+void destroy_wakelocks_in_dev_ns(struct dev_namespace *dev_ns)
+{
+	struct user_wake_lock *l;
+	struct user_wake_lock *list = NULL;
+	struct rb_node *n;
+
+	mutex_lock(&tree_lock);
+
+	pr_info("destroy userspace wakelocks for devns %p\n", dev_ns);
+
+	for (n = rb_first(&user_wake_locks); n != NULL; n = rb_next(n)) {
+		l = rb_entry(n, struct user_wake_lock, node);
+		if (l->dev_ns == dev_ns) {
+			/*
+			 * No rb_erase() during tree traversal; instead,
+			 * build list to free later (l->dev_ns).
+			 */
+			l->dev_ns = (struct dev_namespace *) list;
+			list = l;
+		}
+	}
+
+	for (l = list; l != NULL; l = list) {
+		wake_lock_destroy(&l->wake_lock);
+		rb_erase(&l->node, &user_wake_locks);
+		list = (struct user_wake_lock *) l->dev_ns;
+		kfree(l);
+	}
+
+	mutex_unlock(&tree_lock);
+}
+
+/*
+ * Tag userspace wakelogs with a prefix "PID:", where PID corresponds
+ * to the init task in the corresponding device namespace.
+ */
+static int prefix_dev_ns_pid(char *buf, int len)
+{
+	pid_t pid = dev_ns_init_pid(current_dev_ns());
+
+	if (pid == 1)
+		return len;
+
+	if (len > PAGE_SIZE - 16) {
+		pr_err("wakelock name is too long (%s) for devns\n", buf);
+		return -EINVAL;
+	}
+
+	len += sprintf(buf + len, "[ns:%d]", pid);
+
+	return len;
+}
+#endif /* CONFIG_DEV_NS */
+
 
 static struct user_wake_lock *lookup_wake_lock_name(
 	const char *buf, int allocate, long *timeoutptr)
@@ -78,6 +140,13 @@ static struct user_wake_lock *lookup_wake_lock_name(
 	else if (timeoutptr)
 		*timeoutptr = 0;
 
+#ifdef CONFIG_DEV_NS
+	/* tag userspace wakelocks with their device namespace  */
+	name_len = prefix_dev_ns_pid((char *) buf, name_len);
+	if (name_len < 0)
+		goto bad_arg;
+#endif
+
 	/* Lookup wake lock in rbtree */
 	while (*p) {
 		parent = *p;
@@ -114,6 +183,9 @@ static struct user_wake_lock *lookup_wake_lock_name(
 	memcpy(l->name, buf, name_len);
 	if (debug_mask & DEBUG_NEW)
 		pr_info("lookup_wake_lock_name: new wake lock %s\n", l->name);
+#ifdef CONFIG_DEV_NS
+	l->dev_ns = current_dev_ns();
+#endif
 	wake_lock_init(&l->wake_lock, WAKE_LOCK_SUSPEND, l->name);
 	rb_link_node(&l->node, parent, p);
 	rb_insert_color(&l->node, &user_wake_locks);

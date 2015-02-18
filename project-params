@@ -1,0 +1,51 @@
+#!/bin/bash
+
+###############################################################################
+#
+# This file is intended to be sourced by other scripts, not to be executed
+# on its own.
+#
+###############################################################################
+
+
+###############################################################################
+# Changes to ignore when determining whetherthis repo project is changed.
+#
+# Add ignore changes by using the add_ignore_change() function.
+# Its parameters:
+# 1- Gerrit change-id (or pseudo change-id provided by cellrox-git-log.sh)
+#    to ignore
+#
+# GUIDELINE:
+# Ignore changes done for our build only, for supporting non-standard build
+# hosts, and for debugging.
+
+ignore_change_params() {
+	return #Empty
+}
+
+
+###############################################################################
+# Changes to provide to OEMs as patches.
+#
+# Add patch changes by using the add_patch_change() function.
+# Its parameters:
+# 1- Gerrit change-id (or pseudo change-id provided by cellrox-git-log.sh)
+#    to ignore
+# 2- OPTIONAL change comment
+#
+# Add all changes as a patch by using the add_patch_all_changes() function.
+# Its parameters: none.
+#
+# Set a project comment by using the set_project_comment() function.
+# Its parameters:
+# 1- Comment text
+#
+# GUIDELINE:
+# Patch changes we indend to provide to our OEMs as code patches, whether to
+# be used directly or as an example.
+
+patch_change_params() {
+	set_project_comment "Add the changes needed for multi-persona kernel"
+	add_patch_all_changes
+}

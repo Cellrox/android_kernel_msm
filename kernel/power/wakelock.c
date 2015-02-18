@@ -16,6 +16,7 @@
 #include <linux/list.h>
 #include <linux/rbtree.h>
 #include <linux/slab.h>
+#include <linux/dev_namespace.h>
 
 static DEFINE_MUTEX(wakelocks_lock);
 
@@ -25,6 +26,9 @@ struct wakelock {
 	struct wakeup_source	ws;
 #ifdef CONFIG_PM_WAKELOCKS_GC
 	struct list_head	lru;
+#endif
+#ifdef CONFIG_DEV_NS
+	struct dev_namespace    *dev_ns;
 #endif
 };
 
@@ -131,12 +135,82 @@ static inline void wakelocks_lru_most_recent(struct wakelock *wl) {}
 static inline void wakelocks_gc(void) {}
 #endif /* !CONFIG_PM_WAKELOCKS_GC */
 
+#ifdef CONFIG_DEV_NS
+/* Desroy all the wakelocks that belong to a device namespace */
+void destroy_wakelocks_in_dev_ns(struct dev_namespace *dev_ns)
+{
+       struct wakelock *wl, *list = NULL;
+       struct rb_node *node;
+
+       mutex_lock(&wakelocks_lock);
+
+       for (node = rb_first(&wakelocks_tree); node; node = rb_next(node)) {
+               wl = rb_entry(node, struct wakelock, node);
+               if (wl->dev_ns == dev_ns) {
+		       bool active;
+		       spin_lock_irq(&wl->ws.lock);
+		       active = wl->ws.active;
+		       spin_unlock_irq(&wl->ws.lock);
+		       if (active)
+			   __pm_relax(&wl->ws);
+
+                       /* No rb_erase() during tree traversal; instead,
+                        * build list to free later (wl->dev_ns).  */
+                       wl->dev_ns = (struct dev_namespace *) list;
+                       list = wl;
+               }
+       }
+
+       for (wl = list; wl; wl = list) {
+	       list = (struct wakelock *) wl->dev_ns;
+	       wakeup_source_remove(&wl->ws);
+	       rb_erase(&wl->node, &wakelocks_tree);
+#ifdef CONFIG_PM_WAKELOCKS_GC
+	       list_del(&wl->lru);
+#endif
+	       kfree(wl->name);
+	       kfree(wl);
+	       decrement_wakelocks_number();
+       }
+
+       mutex_unlock(&wakelocks_lock);
+}
+
+/*
+ * Tag userspace wakelogs with a prefix "PID:", where PID corresponds
+ * to the init task in the corresponding device namespace.
+ */
+static int prefix_dev_ns_pid(char *buf, int len)
+{
+       pid_t pid = dev_ns_init_pid(current_dev_ns());
+
+       if (pid == 1)
+               return len;
+
+       if (len > PAGE_SIZE - 16) {
+               pr_err("wakelock name is too long (%s) for devns\n", buf);
+               return -EINVAL;
+       }
+
+       len += sprintf(buf + len, "[ns:%d]", pid);
+
+       return len;
+}
+#endif /* CONFIG_DEV_NS */
+
 static struct wakelock *wakelock_lookup_add(const char *name, size_t len,
 					    bool add_if_not_found)
 {
 	struct rb_node **node = &wakelocks_tree.rb_node;
 	struct rb_node *parent = *node;
 	struct wakelock *wl;
+
+#ifdef CONFIG_DEV_NS
+       /* tag userspace wakelocks with their device namespace  */
+       len = prefix_dev_ns_pid((char *) name, len);
+       if (len < 0)
+		return ERR_PTR(-EINVAL);
+#endif
 
 	while (*node) {
 		int diff;
@@ -172,6 +246,9 @@ static struct wakelock *wakelock_lookup_add(const char *name, size_t len,
 		return ERR_PTR(-ENOMEM);
 	}
 	wl->ws.name = wl->name;
+#ifdef CONFIG_DEV_NS
+	wl->dev_ns = current_dev_ns();
+#endif
 	wakeup_source_add(&wl->ws);
 	rb_link_node(&wl->node, parent, node);
 	rb_insert_color(&wl->node, &wakelocks_tree);

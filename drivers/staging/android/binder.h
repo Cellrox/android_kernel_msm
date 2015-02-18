@@ -91,6 +91,10 @@ struct binder_version {
 #define	BINDER_SET_CONTEXT_MGR		_IOW('b', 7, int)
 #define	BINDER_THREAD_EXIT		_IOW('b', 8, int)
 #define BINDER_VERSION			_IOWR('b', 9, struct binder_version)
+#ifdef CONFIG_DEV_NS
+#define BINDER_GET_NS_CONTEXT_MGR	_IOWR('b', 20, int)
+#define BINDER_SET_REPORT_SENDER_NS	_IO('b', 21)
+#endif
 
 /*
  * NOTE: Two special error codes you should check for when calling

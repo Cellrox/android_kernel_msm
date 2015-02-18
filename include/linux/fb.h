@@ -836,6 +836,9 @@ struct fb_tile_ops {
    output like oopses */
 #define FBINFO_CAN_FORCE_OUTPUT     0x200000
 
+/* corresponds to a namespace-aware (multiplexed) virtual fbinfo */
+#define FBINFO_DEV_NS			0x400000
+
 struct fb_info {
 	atomic_t count;
 	int node;

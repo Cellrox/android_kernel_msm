@@ -24,7 +24,7 @@
 #include <linux/shrinker.h>
 #include "ion_priv.h"
 
-/* #define DEBUG_PAGE_POOL_SHRINKER */
+#define DEBUG_PAGE_POOL_SHRINKER
 
 static struct plist_head pools = PLIST_HEAD_INIT(pools);
 static struct shrinker shrinker;

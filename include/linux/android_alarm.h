@@ -63,6 +63,7 @@ struct alarm {
 	ktime_t			softexpires;
 	ktime_t			expires;
 	void			(*function)(struct alarm *);
+	struct alarm_dev_ns	*alarm_ns;
 };
 
 void alarm_init(struct alarm *alarm,
