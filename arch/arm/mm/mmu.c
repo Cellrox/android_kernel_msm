@@ -912,8 +912,14 @@ static void __init fill_pmd_gaps(void)
 #define fill_pmd_gaps() do { } while (0)
 #endif
 
+#ifdef CONFIG_CELLROX_VMALLOC_OVERRIDE
+static void * __initdata vmalloc_min = (void *)(
+		VMALLOC_END - (CONFIG_CELLROX_VMALLOC_OVERRIDE << 20) -
+		VMALLOC_OFFSET);
+#else
 static void * __initdata vmalloc_min =
 	(void *)(VMALLOC_END - (240 << 20) - VMALLOC_OFFSET);
+#endif
 
 /*
  * vmalloc=size forces the vmalloc area to be exactly 'size'
@@ -923,6 +929,13 @@ static void * __initdata vmalloc_min =
 static int __init early_vmalloc(char *arg)
 {
 	unsigned long vmalloc_reserve = memparse(arg, NULL);
+
+#ifdef CONFIG_CELLROX_VMALLOC_OVERRIDE
+	vmalloc_reserve = CONFIG_CELLROX_VMALLOC_OVERRIDE << 20;
+	printk(KERN_WARNING
+			"overriding vmalloc area size, setting to %dMB\n",
+			CONFIG_CELLROX_VMALLOC_OVERRIDE);
+#endif
 
 	if (vmalloc_reserve < SZ_16M) {
 		vmalloc_reserve = SZ_16M;

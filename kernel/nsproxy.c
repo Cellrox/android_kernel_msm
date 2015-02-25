@@ -22,6 +22,7 @@
 #include <linux/pid_namespace.h>
 #include <net/net_namespace.h>
 #include <linux/ipc_namespace.h>
+#include <linux/dev_namespace.h>
 #include <linux/proc_fs.h>
 #include <linux/file.h>
 #include <linux/syscalls.h>
@@ -39,6 +40,7 @@ struct nsproxy init_nsproxy = {
 #ifdef CONFIG_NET
 	.net_ns	= &init_net,
 #endif
+	.dev_ns = &init_dev_ns,
 };
 
 static inline struct nsproxy *create_nsproxy(void)
@@ -96,8 +98,19 @@ static struct nsproxy *create_new_namespaces(unsigned long flags,
 		goto out_net;
 	}
 
+	new_nsp->dev_ns = copy_dev_ns(flags, tsk);
+	if (IS_ERR(new_nsp->dev_ns)) {
+		err = PTR_ERR(new_nsp->dev_ns);
+		goto out_dev;
+	}
+
+	new_nsp->dev_ns->pid_ns = new_nsp->pid_ns;
+
 	return new_nsp;
 
+out_dev:
+	if (new_nsp->net_ns)
+		put_net(new_nsp->net_ns);
 out_net:
 	if (new_nsp->pid_ns)
 		put_pid_ns(new_nsp->pid_ns);
@@ -175,6 +188,8 @@ void free_nsproxy(struct nsproxy *ns)
 	if (ns->pid_ns)
 		put_pid_ns(ns->pid_ns);
 	put_net(ns->net_ns);
+	if (ns->dev_ns)
+		put_dev_ns(ns->dev_ns);
 	kmem_cache_free(nsproxy_cachep, ns);
 }
 

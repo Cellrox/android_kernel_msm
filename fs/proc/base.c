@@ -2970,6 +2970,51 @@ static int proc_pid_personality(struct seq_file *m, struct pid_namespace *ns,
 	return err;
 }
 
+#ifdef CONFIG_PID_NS
+/* show a task's vpid as seen in the active pid-ns of that task */
+static int vpid_show(struct seq_file *m, void *v)
+{
+	struct inode *inode = m->private;
+	struct pid_namespace *ns, *cur_ns;
+	struct task_struct *p;
+	struct pid *pid;
+
+	p = get_proc_task(inode);
+	if (!p)
+		return -ESRCH;
+
+	cur_ns = task_active_pid_ns(current);
+
+	rcu_read_lock();
+	/* only task in ancestor pid namespace can see a task's vpid */
+	/* note: use active pid namespace - see task_active_pid_ns() */
+	pid = task_pid(p);
+	for (ns = ns_of_pid(pid); ns != NULL; ns = ns->parent) {
+		if (ns == cur_ns) {
+			ns = ns_of_pid(pid);
+			seq_printf(m, "%d\n", pid_nr_ns(pid, ns));
+			break;
+		}
+	}
+	rcu_read_unlock();
+
+	put_task_struct(p);
+	return ns ? 0 : -EACCES;
+}
+
+static int vpid_open(struct inode *inode, struct file *filp)
+{
+	return single_open(filp, vpid_show, inode);
+}
+
+static const struct file_operations proc_pid_vpid_ops = {
+	.open		= vpid_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+#endif /* CONFIG_PID_NS */
+
 /*
  * Thread groups
  */
@@ -3060,6 +3105,9 @@ static const struct pid_entry tgid_base_stuff[] = {
 #endif
 #ifdef CONFIG_HARDWALL
 	INF("hardwall",   S_IRUGO, proc_pid_hardwall),
+#endif
+#ifdef CONFIG_PID_NS
+	REG("vpid",      S_IRUGO|S_IWUSR, proc_pid_vpid_ops),
 #endif
 };
 
@@ -3415,6 +3463,9 @@ static const struct pid_entry tid_base_stuff[] = {
 #endif
 #ifdef CONFIG_HARDWALL
 	INF("hardwall",   S_IRUGO, proc_pid_hardwall),
+#endif
+#ifdef CONFIG_PID_NS
+	REG("vpid",      S_IRUGO|S_IWUSR, proc_pid_vpid_ops),
 #endif
 };
 

@@ -71,6 +71,29 @@ menuconfig FB
 	  (e.g. an accelerated X server) and that are not frame buffer
 	  device-aware may cause unexpected results. If unsure, say N.
 
+config FB_DEV_NS
+	bool "Enable FB device namespace"
+	depends on FB
+	depends on DEV_NS
+	select FB_SYS_FOPS
+	select FB_CFB_FILLRECT
+	select FB_CFB_COPYAREA
+	select FB_CFB_IMAGEBLIT
+	default n
+	---help---
+	  Allow per-namespace virtual framebuffers by mulplexing access to
+	  the hardware framebuffer. This is intended for containers with
+	  device namespace (see COFNIG_DEV_NS) interactive use case, where
+	  there is a single "foreground" container and possibly multiple
+	  "background" containers.
+
+	  It provdies virtualization for the framebuffer subsystem. When
+	  activated, each container has a private view of the framebuffer,
+	  but only the foreground container has pass-through access to the
+	  hardware framebuffer, while the others see a virtual framebuffer.
+
+	  If unsure, say N.
+
 config FIRMWARE_EDID
        bool "Enable firmware EDID"
        depends on FB

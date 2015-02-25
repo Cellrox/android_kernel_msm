@@ -319,6 +319,59 @@ madvise_behavior_valid(int behavior)
 	}
 }
 
+/* mm->mmap should be held by caller */
+int do_madvise(struct mm_struct *mm, unsigned long start, unsigned long end, int behavior)
+{
+	unsigned long tmp;
+	struct vm_area_struct *vma, *prev;
+	int unmapped_error = 0;
+	int error = -EINVAL;
+
+	/*
+	 * If the interval [start,end) covers some unmapped address
+	 * ranges, just ignore them, but return -ENOMEM at the end.
+	 * - different from the way of handling in mlock etc.
+	 */
+	vma = find_vma_prev(mm, start, &prev);
+	if (vma && start > vma->vm_start)
+		prev = vma;
+
+	for (;;) {
+		/* Still start < end. */
+		if (!vma)
+			return -ENOMEM;
+
+		/* Here start < (end|vma->vm_end). */
+		if (start < vma->vm_start) {
+			unmapped_error = -ENOMEM;
+			start = vma->vm_start;
+			if (start >= end)
+				return -ENOMEM;
+		}
+
+		/* Here vma->vm_start <= start < (end|vma->vm_end) */
+		tmp = vma->vm_end;
+		if (end < tmp)
+			tmp = end;
+
+		/* Here vma->vm_start <= start < tmp <= (end|vma->vm_end). */
+		error = madvise_vma(vma, &prev, start, tmp, behavior);
+		if (error)
+			return error;
+		start = tmp;
+		if (prev && start < prev->vm_end)
+			start = prev->vm_end;
+		if (start >= end)
+			return unmapped_error;
+		if (prev)
+			vma = prev->vm_next;
+		else	/* madvise_remove dropped mmap_sem */
+			vma = find_vma(mm, start);
+	}
+
+	return 0;
+}
+
 /*
  * The madvise(2) system call.
  *
@@ -363,9 +416,7 @@ madvise_behavior_valid(int behavior)
  */
 SYSCALL_DEFINE3(madvise, unsigned long, start, size_t, len_in, int, behavior)
 {
-	unsigned long end, tmp;
-	struct vm_area_struct * vma, *prev;
-	int unmapped_error = 0;
+	unsigned long end;
 	int error = -EINVAL;
 	int write;
 	size_t len;
@@ -399,49 +450,7 @@ SYSCALL_DEFINE3(madvise, unsigned long, start, size_t, len_in, int, behavior)
 	if (end == start)
 		goto out;
 
-	/*
-	 * If the interval [start,end) covers some unmapped address
-	 * ranges, just ignore them, but return -ENOMEM at the end.
-	 * - different from the way of handling in mlock etc.
-	 */
-	vma = find_vma_prev(current->mm, start, &prev);
-	if (vma && start > vma->vm_start)
-		prev = vma;
-
-	for (;;) {
-		/* Still start < end. */
-		error = -ENOMEM;
-		if (!vma)
-			goto out;
-
-		/* Here start < (end|vma->vm_end). */
-		if (start < vma->vm_start) {
-			unmapped_error = -ENOMEM;
-			start = vma->vm_start;
-			if (start >= end)
-				goto out;
-		}
-
-		/* Here vma->vm_start <= start < (end|vma->vm_end) */
-		tmp = vma->vm_end;
-		if (end < tmp)
-			tmp = end;
-
-		/* Here vma->vm_start <= start < tmp <= (end|vma->vm_end). */
-		error = madvise_vma(vma, &prev, start, tmp, behavior);
-		if (error)
-			goto out;
-		start = tmp;
-		if (prev && start < prev->vm_end)
-			start = prev->vm_end;
-		error = unmapped_error;
-		if (start >= end)
-			goto out;
-		if (prev)
-			vma = prev->vm_next;
-		else	/* madvise_remove dropped mmap_sem */
-			vma = find_vma(current->mm, start);
-	}
+	error = do_madvise(current->mm, start, end, behavior);
 out:
 	if (write)
 		up_write(&current->mm->mmap_sem);
@@ -449,4 +458,128 @@ out:
 		up_read(&current->mm->mmap_sem);
 
 	return error;
+}
+
+/*
+ * (re) register all processes as candidates for KSM
+ * TODO: quite inefficient to rescan all tasks everytime - would be
+ * better to track forks, execs, and new allocations ,.. oh well.
+ */
+
+static int ksm_register_pid(pid_t pid)
+{
+	struct task_struct *task;
+	struct mm_struct *mm;
+	int err, ret = 0;
+
+	read_lock(&tasklist_lock);
+	task = find_task_by_vpid(pid);
+	if (task)
+		get_task_struct(task);
+	read_unlock(&tasklist_lock);
+
+	if (!task)
+		return -ESRCH;
+
+	mm = get_task_mm(task);
+	if (mm) {
+		down_write(&mm->mmap_sem);
+		err = do_madvise(mm, 0, TASK_SIZE, MADV_MERGEABLE);
+		up_write(&mm->mmap_sem);
+		if (err < 0 && err != -ENOMEM) {
+			pr_info("ksm: register failed (%d:%s)\n",
+				task->pid, task->comm);
+			ret = err;
+		} else {
+			pr_info("ksm: registered process (%d:%s)\n",
+			        task->pid, task->comm);
+		}
+		mmput(mm);
+	}
+
+	put_task_struct(task);
+	return ret;
+}
+
+static int ksm_register_all(void)
+{
+	static atomic_t inside = ATOMIC_INIT(0);
+
+	struct {
+		struct task_struct *task;
+		struct mm_struct *mm;
+	} *procs = NULL;
+
+	struct task_struct *task;
+	struct mm_struct *mm;
+	int count = 0, total = 0;
+	int slack = 0, ret;
+
+	if (atomic_cmpxchg(&inside, 0, 1))
+		return -EBUSY;
+
+	pr_info("ksm: register all tasks mmaps\n");
+
+ retry:
+	/* following cleanup will do nothing on first pass */
+	for (count = 0; count < total; count++) {
+		put_task_struct(procs[count].task);
+		mmput(procs[count].mm);
+	}
+	kfree(procs);
+
+	/* nr_threads likely over-estimates (includes kernel threads) */
+	total = nr_threads + slack;
+	procs = kzalloc(sizeof(*procs) * total, GFP_KERNEL);
+	if (procs == NULL)
+		return -ENOMEM;
+
+	read_lock(&tasklist_lock);
+	for_each_process(task) {
+		mm = get_task_mm(task);
+		if (mm == NULL)
+			continue;
+		if (count == total) {
+			mmput(mm);
+			break;
+		}
+		get_task_struct(task);
+		procs[count].task = task;
+		procs[count].mm = mm;
+		count++;
+	}
+	read_unlock(&tasklist_lock);
+
+	if (count == total) {
+		slack += total / 7; /* add ~14% slack */
+		goto retry;
+	}
+
+	while (count--) {
+		task = procs[count].task;
+		mm = procs[count].mm;
+		down_write(&mm->mmap_sem);
+		ret = do_madvise(mm, 0, TASK_SIZE, MADV_MERGEABLE);
+		up_write(&mm->mmap_sem);
+		if (ret < 0 && ret != -ENOMEM)
+			pr_info("ksm: register failed (%d:%s)\n",
+				task->pid, task->comm);
+		put_task_struct(task);
+		mmput(mm);
+	}
+
+	atomic_set(&inside, 0);
+	kfree(procs);
+
+	pr_info("ksm: registered tasks mmaps (total %d)\n", total);
+
+	return 0;
+}
+
+SYSCALL_DEFINE1(ksm_register, pid_t, pid)
+{
+	if (pid)
+		return ksm_register_pid(pid);
+	else
+		return ksm_register_all();
 }

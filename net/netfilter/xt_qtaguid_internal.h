@@ -338,6 +338,7 @@ struct tag_ref {
 };
 
 struct proc_qtu_data {
+	struct net *net;
 	struct rb_node node;
 	pid_t pid;
 

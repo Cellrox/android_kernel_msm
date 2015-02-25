@@ -19,6 +19,9 @@
 #include <linux/idr.h>
 #include <linux/hdreg.h>
 #include <linux/delay.h>
+#ifdef CONFIG_DEV_NS
+#include <linux/dev_namespace.h>
+#endif
 
 #include <trace/events/block.h>
 
@@ -145,6 +148,9 @@ struct mapped_device {
 	char name[16];
 
 	void *interface_ptr;
+#ifdef CONFIG_DEV_NS
+	struct dev_namespace *dev_ns;
+#endif
 
 	/*
 	 * A list of ios that arrived while we were suspended.
@@ -342,7 +348,11 @@ int dm_deleting_md(struct mapped_device *md)
 
 static int dm_blk_open(struct block_device *bdev, fmode_t mode)
 {
+	int ret = -ENXIO;
 	struct mapped_device *md;
+#ifdef CONFIG_DEV_NS
+	struct dev_namespace *dev_ns = current_dev_ns();
+#endif
 
 	spin_lock(&_minor_lock);
 
@@ -350,19 +360,24 @@ static int dm_blk_open(struct block_device *bdev, fmode_t mode)
 	if (!md)
 		goto out;
 
-	if (test_bit(DMF_FREEING, &md->flags) ||
-	    dm_deleting_md(md)) {
-		md = NULL;
+#ifdef CONFIG_DEV_NS
+	if (md->dev_ns != dev_ns && dev_ns != &init_dev_ns) {
+		ret = -EPERM;
 		goto out;
 	}
+#endif
+
+	if (test_bit(DMF_FREEING, &md->flags) || dm_deleting_md(md))
+		goto out;
 
 	dm_get(md);
 	atomic_inc(&md->open_count);
+	ret = 0;
 
 out:
 	spin_unlock(&_minor_lock);
 
-	return md ? 0 : -ENXIO;
+	return ret;
 }
 
 static int dm_blk_close(struct gendisk *disk, fmode_t mode)
@@ -1895,6 +1910,10 @@ static struct mapped_device *alloc_dev(int minor)
 
 	BUG_ON(old_md != MINOR_ALLOCED);
 
+#ifdef CONFIG_DEV_NS
+	md->dev_ns = get_dev_ns(current_dev_ns());
+#endif
+
 	return md;
 
 bad_bdev:
@@ -1919,6 +1938,9 @@ static void free_dev(struct mapped_device *md)
 {
 	int minor = MINOR(disk_devt(md->disk));
 
+#ifdef CONFIG_DEV_NS
+	put_dev_ns(md->dev_ns);
+#endif
 	unlock_fs(md);
 	bdput(md->bdev);
 	destroy_workqueue(md->wq);

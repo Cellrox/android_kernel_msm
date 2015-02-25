@@ -354,3 +354,11 @@ proprietary programs.  If your program is a subroutine library, you may
 consider it more useful to permit linking proprietary applications with the
 library.  If this is what you want to do, use the GNU Library General
 Public License instead of this License.
+
+_______________________________________________________________________________
+The source code of this modified version of the program can be obtained, at
+no cost, at https://github.com/Cellrox
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the license above for more details.
+Cellrox can be contacted at: info@cellrox.com, 3 Ha-Arad St. Tel Aviv Israel

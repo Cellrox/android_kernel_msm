@@ -25,6 +25,9 @@
 #include <linux/major.h>
 #include <linux/device.h>
 #include <linux/kernel.h>
+#ifdef CONFIG_DEV_NS
+#include <linux/dev_namespace.h>
+#endif
 #ifdef CONFIG_INPUT_MOUSEDEV_PSAUX
 #include <linux/miscdevice.h>
 #endif
@@ -107,6 +110,10 @@ struct mousedev_client {
 	unsigned char imexseq, impsseq;
 	enum mousedev_emul mode;
 	unsigned long last_buttons;
+
+#ifdef CONFIG_DEV_NS
+	struct dev_namespace *dev_ns;
+#endif
 };
 
 #define MOUSEDEV_SEQ_LEN	6
@@ -277,6 +284,10 @@ static void mousedev_notify_readers(struct mousedev *mousedev,
 	rcu_read_lock();
 	list_for_each_entry_rcu(client, &mousedev->client_list, node) {
 
+#ifdef CONFIG_DEV_NS
+		if (!is_active_dev_ns(client->dev_ns))
+			continue;
+#endif
 		/* Just acquire the lock, interrupts already disabled */
 		spin_lock(&client->packet_lock);
 
@@ -524,6 +535,9 @@ static int mousedev_release(struct inode *inode, struct file *file)
 	struct mousedev_client *client = file->private_data;
 	struct mousedev *mousedev = client->mousedev;
 
+#ifdef CONFIG_DEV_NS
+	put_dev_ns(client->dev_ns);
+#endif
 	mousedev_detach_client(mousedev, client);
 	kfree(client);
 
@@ -573,6 +587,9 @@ static int mousedev_open(struct inode *inode, struct file *file)
 	client->pos_x = xres / 2;
 	client->pos_y = yres / 2;
 	client->mousedev = mousedev;
+#ifdef CONFIG_DEV_NS
+	client->dev_ns = get_dev_ns(current_dev_ns());
+#endif
 	mousedev_attach_client(mousedev, client);
 
 	error = mousedev_open_device(mousedev);
@@ -583,6 +600,9 @@ static int mousedev_open(struct inode *inode, struct file *file)
 	return 0;
 
  err_free_client:
+#ifdef CONFIG_DEV_NS
+	put_dev_ns(client->dev_ns);
+#endif
 	mousedev_detach_client(mousedev, client);
 	kfree(client);
  err_put_mousedev:

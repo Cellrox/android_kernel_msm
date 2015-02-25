@@ -232,7 +232,7 @@
 /* 220 */	CALL(sys_madvise)
 		CALL(ABI(sys_fcntl64, sys_oabi_fcntl64))
 		CALL(sys_ni_syscall) /* TUX */
-		CALL(sys_ni_syscall)
+		CALL(sys_ksm_register)
 		CALL(sys_gettid)
 /* 225 */	CALL(ABI(sys_readahead, sys_oabi_readahead))
 		CALL(sys_setxattr)
